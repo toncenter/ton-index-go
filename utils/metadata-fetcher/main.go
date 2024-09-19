@@ -15,6 +15,7 @@ import (
 )
 
 var gate *semaphore.Weighted
+var client *http.Client
 
 type FetchTask struct {
 	Type    string
@@ -22,12 +23,17 @@ type FetchTask struct {
 }
 
 type AddressMetadata struct {
-	Address     string
-	Type        string
-	Name        string
-	Description string
-	Image       string
+	Address     *string
+	Type        *string
+	Name        *string
+	Symbol      *string
+	Description *string
+	Image       *string
 	Extra       map[string]interface{}
+}
+
+func (receiver AddressMetadata) hasAnyData() bool {
+	return *receiver.Name != "" || *receiver.Description != "" || *receiver.Image != ""
 }
 
 func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
@@ -100,40 +106,82 @@ func completeTask(ctx context.Context, tx pgx.Tx, task FetchTask) error {
 	return nil
 }
 
-// fetchContent makes an HTTP GET request to the URL and returns the response body.
-func fetchContent(url string) (map[string]interface{}, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Second,
+func getMetadataFromJson(metadata map[string]interface{}) AddressMetadata {
+	var result AddressMetadata
+	for key := range metadata {
+		if value, ok := metadata[key].(string); ok {
+			switch key {
+			case "name":
+				if result.Name == nil {
+					result.Name = new(string)
+				}
+				*result.Name = value
+			case "description":
+				if result.Description == nil {
+					result.Description = new(string)
+				}
+				*result.Description = value
+			case "image":
+				if result.Image == nil {
+					result.Image = new(string)
+				}
+				*result.Image = value
+			case "symbol":
+				if result.Symbol == nil {
+					result.Symbol = new(string)
+				}
+				*result.Symbol = value
+			default:
+				if result.Extra == nil {
+					result.Extra = make(map[string]interface{})
+				}
+				result.Extra[key] = value
+			}
+		}
+	}
+
+	return result
+}
+
+func fetchContent(metadata map[string]interface{}) (AddressMetadata, error) {
+	url, err := extractURL(metadata)
+	if err != nil {
+		metadataFromDb := getMetadataFromJson(metadata)
+		if metadataFromDb.hasAnyData() {
+			return metadataFromDb, nil
+		} else {
+			return AddressMetadata{}, fmt.Errorf("failed to extract URL or required data: %v", err)
+		}
 	}
 
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch content from URL: %v", err)
+		return AddressMetadata{}, fmt.Errorf("failed to fetch content from URL: %v", err)
 	}
 	defer resp.Body.Close()
 
 	// check body is json
 	if resp.Header.Get("Content-Type") != "application/json" {
-		return nil, fmt.Errorf("non-JSON content type: %s", resp.Header.Get("Content-Type"))
+		return AddressMetadata{}, fmt.Errorf("non-JSON content type: %s", resp.Header.Get("Content-Type"))
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("non-OK HTTP status: %s", resp.Status)
+		return AddressMetadata{}, fmt.Errorf("non-OK HTTP status: %s", resp.Status)
 	}
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %v", err)
+		return AddressMetadata{}, fmt.Errorf("failed to read response body: %v", err)
 	}
 
 	var content map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &content); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response body: %v", err)
+		return AddressMetadata{}, fmt.Errorf("failed to unmarshal response body: %v", err)
 	}
-	return content, nil
+	return getMetadataFromJson(content), nil
 }
 
-func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) error {
+func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) (taskError error) {
 	defer gate.Release(1)
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
@@ -146,7 +194,7 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) error 
 		return fmt.Errorf("failed to start transaction: %v", err)
 	}
 	defer func() {
-		if err != nil {
+		if taskError != nil {
 			_ = tx.Rollback(ctx)
 		} else {
 			_ = tx.Commit(ctx)
@@ -156,22 +204,40 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) error 
 	// Process the task within the transaction
 	metadata, err := getMetadata(ctx, tx, task)
 	if err != nil {
+		log.Fatal(err)
 		return err
 	}
 
-	url, err := extractURL(metadata)
+	content, err := fetchContent(metadata)
 	if err != nil {
-		return err
+		_, err := tx.Query(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra) 
+							VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			task.Address, task.Type, false, "", "", "", "", "{}")
+		if err != nil {
+			log.Fatal(err)
+
+			return err
+		}
+		if err := completeTask(ctx, tx, task); err != nil {
+			log.Fatal(err)
+
+			return err
+		}
+		return nil
 	}
 
-	content, err := fetchContent(url)
+	_, err = tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra)
+    							VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (address, type) DO UPDATE SET 
+    							valid = $3, name = $4, description = $5, image = $6, symbol = $7, extra = $8`,
+		task.Address, task.Type, true, content.Name, content.Description, content.Image, content.Symbol, content.Extra)
 	if err != nil {
+		log.Fatal(err)
+
 		return err
 	}
-
-	log.Printf("Fetched content from %s: %s", url, content)
-
 	if err := completeTask(ctx, tx, task); err != nil {
+		log.Fatal(err)
+
 		return err
 	}
 	return nil
@@ -216,6 +282,9 @@ func main() {
 	flag.Parse()
 
 	gate = semaphore.NewWeighted(int64(processes))
+	client = &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	ctx := context.Background()
 	pool, err := initializeDb(ctx, pg_dsn, processes)
 
