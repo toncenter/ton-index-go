@@ -317,6 +317,7 @@ func main() {
 			}
 			go processTask(ctx, pool, task)
 		}
+		time.Sleep(time.Second)
 	}
 
 }
