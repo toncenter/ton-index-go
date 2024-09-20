@@ -98,7 +98,7 @@ func extractURL(metadata map[string]interface{}) (string, error) {
 
 // completeTask removes the task from the tasks table.
 func completeTask(ctx context.Context, tx pgx.Tx, task FetchTask) error {
-	query := "UPDATE fetch_metadata_tasks SET status = 'completed' WHERE type = $1 AND address = $2"
+	query := "DELETE FROM fetch_metadata_tasks WHERE type = $1 AND address = $2"
 	_, err := tx.Exec(ctx, query, task.Type, task.Address)
 	if err != nil {
 		return fmt.Errorf("failed to delete task: %v", err)
@@ -210,9 +210,9 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) (taskE
 
 	content, err := fetchContent(metadata)
 	if err != nil {
-		_, err := tx.Query(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra) 
+		_, err := tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra) 
 							VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			task.Address, task.Type, false, "", "", "", "", "{}")
+			task.Address, task.Type, false, nil, nil, nil, nil, nil)
 		if err != nil {
 			log.Fatal(err)
 
