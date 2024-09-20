@@ -10,6 +10,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"time"
 )
@@ -17,9 +18,17 @@ import (
 var gate *semaphore.Weighted
 var client *http.Client
 
+const (
+	maxRetries        = 4                // Maximum number of retries per task
+	initialBackoff    = 10 * time.Second // Initial backoff duration
+	backoffMultiplier = 2                // Multiplier for exponential backoff
+	maxBackoff        = 1 * time.Minute  // Maximum backoff duration
+)
+
 type FetchTask struct {
 	Type    string
 	Address string
+	Retry   int
 }
 
 type AddressMetadata struct {
@@ -44,7 +53,13 @@ func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
 	}
 	defer conn.Release()
 
-	rows, err := conn.Query(ctx, "SELECT type, address FROM fetch_metadata_tasks WHERE status='not_started' LIMIT 100")
+	rows, err := conn.Query(ctx, `
+        SELECT type, address, retries FROM fetch_metadata_tasks
+        WHERE status = 'ready'
+        AND retries <= $1
+        AND (retry_at <= NOW() OR retry_at is NULL)
+        LIMIT 100
+    `, maxRetries)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch tasks: %v", err)
 	}
@@ -53,7 +68,7 @@ func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
 	var tasks []FetchTask
 	for rows.Next() {
 		var task FetchTask
-		if err := rows.Scan(&task.Type, &task.Address); err != nil {
+		if err := rows.Scan(&task.Type, &task.Address, &task.Retry); err != nil {
 			return nil, fmt.Errorf("failed to scan task: %v", err)
 		}
 		tasks = append(tasks, task)
@@ -204,26 +219,14 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) (taskE
 	// Process the task within the transaction
 	metadata, err := getMetadata(ctx, tx, task)
 	if err != nil {
-		log.Fatal(err)
-		return err
+		log.Printf("Error getting metadata for task %v: %v", task, err)
+		return handleTaskFailure(ctx, tx, task, err)
 	}
 
 	content, err := fetchContent(metadata)
 	if err != nil {
-		_, err := tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra) 
-							VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			task.Address, task.Type, false, nil, nil, nil, nil, nil)
-		if err != nil {
-			log.Fatal(err)
-
-			return err
-		}
-		if err := completeTask(ctx, tx, task); err != nil {
-			log.Fatal(err)
-
-			return err
-		}
-		return nil
+		log.Printf("Error fetching content for task %v: %v", task, err)
+		return handleTaskFailure(ctx, tx, task, err)
 	}
 
 	_, err = tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra)
@@ -231,16 +234,60 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) (taskE
     							valid = $3, name = $4, description = $5, image = $6, symbol = $7, extra = $8`,
 		task.Address, task.Type, true, content.Name, content.Description, content.Image, content.Symbol, content.Extra)
 	if err != nil {
-		log.Fatal(err)
-
-		return err
+		log.Printf("Error inserting metadata for task %v: %v", task, err)
+		return handleTaskFailure(ctx, tx, task, err)
 	}
 	if err := completeTask(ctx, tx, task); err != nil {
-		log.Fatal(err)
-
-		return err
+		log.Printf("Error completing task %v: %v", task, err)
+		return handleTaskFailure(ctx, tx, task, err)
 	}
 	return nil
+}
+
+func handleTaskFailure(ctx context.Context, tx pgx.Tx, task FetchTask, taskErr error) error {
+	delay := calculateBackoffDelay(task.Retry)
+
+	if task.Retry < maxRetries {
+		_, err := tx.Exec(ctx, `
+        UPDATE fetch_metadata_tasks
+        SET status = 'ready',
+            retry_at = NOW() + $1 * INTERVAL '1 second',
+        	retries = retries + 1
+        WHERE type = $2 AND address = $3
+    `, int64(delay.Seconds()), task.Type, task.Address)
+		if err != nil {
+			log.Printf("Error updating retry_at for task %v: %v", task, err)
+			return err
+		}
+	} else {
+		_, err := tx.Exec(ctx, `
+		UPDATE fetch_metadata_tasks
+		SET status = 'failed'
+		WHERE type = $1 AND address = $2`,
+			task.Type, task.Address)
+		if err != nil {
+			log.Printf("Error updating status to failed for task %v: %v", task, err)
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (address, type) DO UPDATE SET valid = $3`,
+			task.Address, task.Type, false, nil, nil, nil, nil, nil)
+		if err != nil {
+			log.Printf("Error inserting metadata for failed task %v: %v", task, err)
+			return err
+		}
+
+	}
+	return nil
+}
+
+func calculateBackoffDelay(retry int) time.Duration {
+	delay := initialBackoff * time.Duration(math.Pow(float64(backoffMultiplier), float64(retry-1)))
+	if delay > maxBackoff {
+		delay = maxBackoff
+	}
+	return delay
 }
 
 func initializeDb(ctx context.Context, pgDsn string, processes int) (*pgxpool.Pool, error) {
@@ -265,7 +312,15 @@ func updateStalledTasks(ctx context.Context, pool *pgxpool.Pool) {
 			log.Fatal("failed to acquire connection: ", err)
 		}
 
-		_, err = conn.Exec(ctx, "UPDATE fetch_metadata_tasks SET status='not_started' WHERE status='in_progress' AND started_at < NOW() - INTERVAL '5 minutes'")
+		_, err = conn.Exec(ctx, `
+            UPDATE fetch_metadata_tasks
+            SET status = 'ready',
+                retry_at = NOW() + LEAST(
+                    $1 * POWER($2, retries - 1),
+                    $3
+                ) * INTERVAL '1 second'
+            WHERE status = 'in_progress' AND started_at < NOW() - INTERVAL '5 minutes'`,
+			int64(initialBackoff.Seconds()), backoffMultiplier, int64(maxBackoff.Seconds()))
 		if err != nil {
 			log.Fatal("failed to update stalled tasks: ", err)
 		}
@@ -307,7 +362,11 @@ func main() {
 		}
 
 		for _, task := range tasks {
-			_, err := conn.Query(ctx, "UPDATE fetch_metadata_tasks SET status='in_progress', started_at=NOW() WHERE type = $1 AND address = $2", task.Type, task.Address)
+			_, err := conn.Exec(ctx, `UPDATE fetch_metadata_tasks
+					SET status = 'in_progress',
+						started_at = NOW()
+					WHERE type = $1 AND address = $2`,
+				task.Type, task.Address)
 			if err != nil {
 				continue
 			}
