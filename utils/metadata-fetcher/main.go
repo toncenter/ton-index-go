@@ -18,12 +18,11 @@ import (
 var gate *semaphore.Weighted
 var client *http.Client
 
-const (
-	maxRetries        = 4                // Maximum number of retries per task
-	initialBackoff    = 10 * time.Second // Initial backoff duration
-	backoffMultiplier = 2                // Multiplier for exponential backoff
-	maxBackoff        = 1 * time.Minute  // Maximum backoff duration
-)
+var max_retries int
+var initial_backoff time.Duration
+var backoff_multiplier float64
+var max_backoff time.Duration
+var stalled_task_interval time.Duration
 
 type FetchTask struct {
 	Type    string
@@ -57,9 +56,9 @@ func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
         SELECT type, address, retries FROM fetch_metadata_tasks
         WHERE status = 'ready'
         AND retries <= $1
-        AND (retry_at <= NOW() OR retry_at is NULL)
+        AND (retry_at <= EXTRACT(EPOCH FROM NOW())::bigint OR retry_at is NULL)
         LIMIT 100
-    `, maxRetries)
+    `, max_retries)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch tasks: %v", err)
 	}
@@ -77,24 +76,24 @@ func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
 }
 
 func getMetadata(ctx context.Context, tx pgx.Tx, task FetchTask) (map[string]interface{}, error) {
-	var metadataBytes []byte
-	var fieldName string
+	var metadata_bytes []byte
+	var field_name string
 	switch task.Type {
 	case "nft_collections":
-		fieldName = "collection_content"
+		field_name = "collection_content"
 	case "nft_items":
-		fieldName = "content"
+		field_name = "content"
 	case "jetton_masters":
-		fieldName = "jetton_content"
+		field_name = "jetton_content"
 	}
-	query := fmt.Sprintf("SELECT %s as metadata FROM %s WHERE address = $1", fieldName, task.Type)
-	err := tx.QueryRow(ctx, query, task.Address).Scan(&metadataBytes)
+	query := fmt.Sprintf("SELECT %s as metadata FROM %s WHERE address = $1", field_name, task.Type)
+	err := tx.QueryRow(ctx, query, task.Address).Scan(&metadata_bytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch metadata: %v", err)
 	}
 
 	var metadata map[string]interface{}
-	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+	if err := json.Unmarshal(metadata_bytes, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal metadata: %v", err)
 	}
 	return metadata, nil
@@ -161,9 +160,9 @@ func getMetadataFromJson(metadata map[string]interface{}) AddressMetadata {
 func fetchContent(metadata map[string]interface{}) (AddressMetadata, error) {
 	url, err := extractURL(metadata)
 	if err != nil {
-		metadataFromDb := getMetadataFromJson(metadata)
-		if metadataFromDb.hasAnyData() {
-			return metadataFromDb, nil
+		metadata_from_db := getMetadataFromJson(metadata)
+		if metadata_from_db.hasAnyData() {
+			return metadata_from_db, nil
 		} else {
 			return AddressMetadata{}, fmt.Errorf("failed to extract URL or required data: %v", err)
 		}
@@ -175,22 +174,17 @@ func fetchContent(metadata map[string]interface{}) (AddressMetadata, error) {
 	}
 	defer resp.Body.Close()
 
-	// check body is json
-	if resp.Header.Get("Content-Type") != "application/json" {
-		return AddressMetadata{}, fmt.Errorf("non-JSON content type: %s", resp.Header.Get("Content-Type"))
-	}
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return AddressMetadata{}, fmt.Errorf("non-OK HTTP status: %s", resp.Status)
 	}
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	body_bytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return AddressMetadata{}, fmt.Errorf("failed to read response body: %v", err)
 	}
 
 	var content map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &content); err != nil {
+	if err := json.Unmarshal(body_bytes, &content); err != nil {
 		return AddressMetadata{}, fmt.Errorf("failed to unmarshal response body: %v", err)
 	}
 	return getMetadataFromJson(content), nil
@@ -229,10 +223,10 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) (taskE
 		return handleTaskFailure(ctx, tx, task, err)
 	}
 
-	_, err = tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra)
-    							VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (address, type) DO UPDATE SET 
-    							valid = $3, name = $4, description = $5, image = $6, symbol = $7, extra = $8`,
-		task.Address, task.Type, true, content.Name, content.Description, content.Image, content.Symbol, content.Extra)
+	_, err = tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra, updated_at)
+    							VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (address, type) DO UPDATE SET 
+    							valid = $3, name = $4, description = $5, image = $6, symbol = $7, extra = $8, updated_at = $9`,
+		task.Address, task.Type, true, content.Name, content.Description, content.Image, content.Symbol, content.Extra, time.Now().Unix())
 	if err != nil {
 		log.Printf("Error inserting metadata for task %v: %v", task, err)
 		return handleTaskFailure(ctx, tx, task, err)
@@ -247,11 +241,11 @@ func processTask(ctx context.Context, pool *pgxpool.Pool, task FetchTask) (taskE
 func handleTaskFailure(ctx context.Context, tx pgx.Tx, task FetchTask, taskErr error) error {
 	delay := calculateBackoffDelay(task.Retry)
 
-	if task.Retry < maxRetries {
+	if task.Retry < max_retries {
 		_, err := tx.Exec(ctx, `
         UPDATE fetch_metadata_tasks
         SET status = 'ready',
-            retry_at = NOW() + $1 * INTERVAL '1 second',
+            retry_at = EXTRACT(EPOCH FROM NOW())::bigint + $1,
         	retries = retries + 1
         WHERE type = $2 AND address = $3
     `, int64(delay.Seconds()), task.Type, task.Address)
@@ -269,23 +263,26 @@ func handleTaskFailure(ctx context.Context, tx pgx.Tx, task FetchTask, taskErr e
 			log.Printf("Error updating status to failed for task %v: %v", task, err)
 			return err
 		}
+	}
+	extra := map[string]interface{}{
+		"error": taskErr.Error(),
+	}
+	extra_json, _ := json.Marshal(extra)
 
-		_, err = tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (address, type) DO UPDATE SET valid = $3`,
-			task.Address, task.Type, false, nil, nil, nil, nil, nil)
-		if err != nil {
-			log.Printf("Error inserting metadata for failed task %v: %v", task, err)
-			return err
-		}
-
+	_, err := tx.Exec(ctx, `INSERT INTO address_metadata (address, type, valid, name, description, image, symbol, extra, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (address, type) DO UPDATE SET valid = $3`,
+		task.Address, task.Type, false, nil, nil, nil, nil, extra_json, time.Now().Unix())
+	if err != nil {
+		log.Printf("Error inserting metadata for failed task %v: %v", task, err)
+		return err
 	}
 	return nil
 }
 
 func calculateBackoffDelay(retry int) time.Duration {
-	delay := initialBackoff * time.Duration(math.Pow(float64(backoffMultiplier), float64(retry-1)))
-	if delay > maxBackoff {
-		delay = maxBackoff
+	delay := initial_backoff * time.Duration(math.Pow(backoff_multiplier, float64(retry-1)))
+	if delay > max_backoff {
+		delay = max_backoff
 	}
 	return delay
 }
@@ -315,12 +312,12 @@ func updateStalledTasks(ctx context.Context, pool *pgxpool.Pool) {
 		_, err = conn.Exec(ctx, `
             UPDATE fetch_metadata_tasks
             SET status = 'ready',
-                retry_at = NOW() + LEAST(
+                retry_at =  EXTRACT(EPOCH FROM NOW())::bigint + LEAST(
                     $1 * POWER($2, retries - 1),
                     $3
-                ) * INTERVAL '1 second'
-            WHERE status = 'in_progress' AND started_at < NOW() - INTERVAL '5 minutes'`,
-			int64(initialBackoff.Seconds()), backoffMultiplier, int64(maxBackoff.Seconds()))
+                )
+            WHERE status = 'in_progress' AND started_at < EXTRACT(EPOCH FROM NOW())::bigint - $4`,
+			int64(initial_backoff.Seconds()), backoff_multiplier, int64(max_backoff.Seconds()), stalled_task_interval)
 		if err != nil {
 			log.Fatal("failed to update stalled tasks: ", err)
 		}
@@ -334,6 +331,12 @@ func main() {
 	var processes int
 	flag.StringVar(&pg_dsn, "pg", "postgresql://localhost:5432", "PostgreSQL connection string")
 	flag.IntVar(&processes, "processes", 32, "Set number of parallel queries")
+	flag.DurationVar(&initial_backoff, "initial-backoff", 5*time.Second, "Initial backoff duration")
+	flag.Float64Var(&backoff_multiplier, "backoff-multiplier", 2, "Backoff multiplier")
+	flag.DurationVar(&max_backoff, "max-backoff", 5*time.Minute, "Maximum backoff duration")
+	flag.IntVar(&max_retries, "max-retries", 5, "Maximum number of retries")
+	flag.DurationVar(&stalled_task_interval, "stalled-task-interval", 5*time.Minute,
+		"Interval to update stalled tasks")
 	flag.Parse()
 
 	gate = semaphore.NewWeighted(int64(processes))
@@ -362,18 +365,23 @@ func main() {
 		}
 
 		for _, task := range tasks {
-			_, err := conn.Exec(ctx, `UPDATE fetch_metadata_tasks
-					SET status = 'in_progress',
-						started_at = NOW()
-					WHERE type = $1 AND address = $2`,
-				task.Type, task.Address)
-			if err != nil {
-				continue
-			}
 			err = gate.Acquire(ctx, 1)
 			if err != nil {
-				log.Fatalf("failed to acquire worker: %s", err.Error())
+				log.Printf("failed to acquire worker: %s\n", err.Error())
+				continue
 			}
+			_, err := conn.Exec(ctx, `UPDATE fetch_metadata_tasks
+					SET status = 'in_progress',
+						started_at = EXTRACT(EPOCH FROM NOW())::bigint
+					WHERE type = $1 AND address = $2`,
+				task.Type, task.Address)
+			log.Printf("Acquired task %v", task)
+			if err != nil {
+				log.Println("Error updating task status: ", err)
+				gate.Release(1)
+				continue
+			}
+
 			go processTask(ctx, pool, task)
 		}
 		time.Sleep(time.Second)
