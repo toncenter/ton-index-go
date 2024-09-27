@@ -41,7 +41,7 @@ type AddressMetadata struct {
 }
 
 func (receiver AddressMetadata) hasAnyData() bool {
-	return *receiver.Name != "" || *receiver.Description != "" || *receiver.Image != ""
+	return receiver.Name != nil || receiver.Description != nil || receiver.Image != nil
 }
 
 func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
