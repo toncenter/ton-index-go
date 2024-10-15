@@ -24,10 +24,18 @@ var backoff_multiplier float64
 var max_backoff time.Duration
 var stalled_task_interval time.Duration
 
+type BackgroundTask struct {
+	Id    int64
+	Type  string
+	Retry int
+	Data  map[string]interface{}
+}
+
 type FetchTask struct {
-	Type    string
 	Address string
+	Type    string
 	Retry   int
+	TaskId  int64
 }
 
 type AddressMetadata struct {
@@ -53,9 +61,9 @@ func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
 	defer conn.Release()
 
 	rows, err := conn.Query(ctx, `
-        SELECT type, address, retries FROM fetch_metadata_tasks
+        SELECT id, type, data, retries  FROM background_tasks
         WHERE status = 'ready'
-        AND retries <= $1
+        AND type = 'fetch_metadata' AND retries <= $1
         AND (retry_at <= EXTRACT(EPOCH FROM NOW())::bigint OR retry_at is NULL)
         LIMIT 100
     `, max_retries)
@@ -66,11 +74,16 @@ func fetchTasks(ctx context.Context, pool *pgxpool.Pool) ([]FetchTask, error) {
 
 	var tasks []FetchTask
 	for rows.Next() {
-		var task FetchTask
-		if err := rows.Scan(&task.Type, &task.Address, &task.Retry); err != nil {
+		var task BackgroundTask
+		if err := rows.Scan(&task.Id, &task.Type, &task.Data, &task.Retry); err != nil {
 			return nil, fmt.Errorf("failed to scan task: %v", err)
 		}
-		tasks = append(tasks, task)
+		tasks = append(tasks, FetchTask{
+			TaskId:  task.Id,
+			Type:    task.Data["type"].(string),
+			Address: task.Data["address"].(string),
+			Retry:   task.Retry,
+		})
 	}
 	return tasks, nil
 }
@@ -112,8 +125,8 @@ func extractURL(metadata map[string]interface{}) (string, error) {
 
 // completeTask removes the task from the tasks table.
 func completeTask(ctx context.Context, tx pgx.Tx, task FetchTask) error {
-	query := "DELETE FROM fetch_metadata_tasks WHERE type = $1 AND address = $2"
-	_, err := tx.Exec(ctx, query, task.Type, task.Address)
+	query := "DELETE FROM background_tasks WHERE id = $1"
+	_, err := tx.Exec(ctx, query, task.TaskId)
 	if err != nil {
 		return fmt.Errorf("failed to delete task: %v", err)
 	}
@@ -243,22 +256,22 @@ func handleTaskFailure(ctx context.Context, tx pgx.Tx, task FetchTask, taskErr e
 
 	if task.Retry < max_retries {
 		_, err := tx.Exec(ctx, `
-        UPDATE fetch_metadata_tasks
+        UPDATE background_tasks
         SET status = 'ready',
             retry_at = EXTRACT(EPOCH FROM NOW())::bigint + $1,
-        	retries = retries + 1
-        WHERE type = $2 AND address = $3
-    `, int64(delay.Seconds()), task.Type, task.Address)
+        	retries = retries + 1,
+            error = $3
+        WHERE id = $2
+    `, int64(delay.Seconds()), task.TaskId, taskErr.Error())
 		if err != nil {
 			log.Printf("Error updating retry_at for task %v: %v", task, err)
 			return err
 		}
 	} else {
 		_, err := tx.Exec(ctx, `
-		UPDATE fetch_metadata_tasks
-		SET status = 'failed'
-		WHERE type = $1 AND address = $2`,
-			task.Type, task.Address)
+		UPDATE background_tasks
+		SET status = 'failed', error = $2, retries = retries + 1
+		WHERE id = $1`, task.TaskId, taskErr.Error())
 		if err != nil {
 			log.Printf("Error updating status to failed for task %v: %v", task, err)
 			return err
@@ -306,20 +319,20 @@ func updateStalledTasks(ctx context.Context, pool *pgxpool.Pool) {
 	for {
 		conn, err := pool.Acquire(ctx)
 		if err != nil {
-			log.Fatal("failed to acquire connection: ", err)
+			log.Printf("failed to acquire connection: %v", err)
 		}
 
 		_, err = conn.Exec(ctx, `
-            UPDATE fetch_metadata_tasks
+            UPDATE background_tasks
             SET status = 'ready',
                 retry_at =  EXTRACT(EPOCH FROM NOW())::bigint + LEAST(
                     $1 * POWER($2, retries - 1),
                     $3
                 )
-            WHERE status = 'in_progress' AND started_at < EXTRACT(EPOCH FROM NOW())::bigint - $4`,
+            WHERE type = 'fetch_metadata' AND status = 'in_progress' AND started_at < EXTRACT(EPOCH FROM NOW())::bigint - $4`,
 			int64(initial_backoff.Seconds()), backoff_multiplier, int64(max_backoff.Seconds()), stalled_task_interval)
 		if err != nil {
-			log.Fatal("failed to update stalled tasks: ", err)
+			log.Print("failed to update stalled tasks: ", err)
 		}
 		conn.Release()
 		time.Sleep(time.Minute)
@@ -370,12 +383,11 @@ func main() {
 				log.Printf("failed to acquire worker: %s\n", err.Error())
 				continue
 			}
-			_, err := conn.Exec(ctx, `UPDATE fetch_metadata_tasks
+			_, err := conn.Exec(ctx, `UPDATE background_tasks
 					SET status = 'in_progress',
 						started_at = EXTRACT(EPOCH FROM NOW())::bigint
-					WHERE type = $1 AND address = $2`,
-				task.Type, task.Address)
-			log.Printf("Acquired task %v", task)
+					WHERE id = $1`,
+				task.TaskId)
 			if err != nil {
 				log.Println("Error updating task status: ", err)
 				gate.Release(1)

@@ -1234,16 +1234,13 @@ func queryMetadataImpl(addr_list []string, conn *pgxpool.Conn, settings RequestS
 	ctx, cancel_ctx := context.WithTimeout(context.Background(), settings.Timeout)
 	defer cancel_ctx()
 	rows, err := conn.Query(ctx, query, pq.Array(addr_list))
-	for _, item := range addr_list {
-		log.Printf("queryMetadataImpl: %v", item)
-	}
 	if err != nil {
 		return nil, IndexError{Code: 500, Message: err.Error()}
 	}
 
 	defer rows.Close()
 
-	tasks := []MetadataFetchTask{}
+	tasks := []BackgroundTask{}
 	token_info_map := map[string][]TokenInfo{}
 
 	for rows.Next() {
@@ -1253,7 +1250,11 @@ func queryMetadataImpl(addr_list []string, conn *pgxpool.Conn, settings RequestS
 			return nil, IndexError{Code: 500, Message: err.Error()}
 		}
 		if row.Valid == nil {
-			tasks = append(tasks, MetadataFetchTask{Address: row.Address, Type: row.Type})
+			data := map[string]interface{}{
+				"address": row.Address,
+				"type":    row.Type,
+			}
+			tasks = append(tasks, BackgroundTask{Type: "fetch_metadata", Data: data})
 			token_info_map[row.Address] = append(token_info_map[row.Address], TokenInfo{
 				Address: row.Address,
 				Type:    row.Type,
@@ -1282,8 +1283,8 @@ func queryMetadataImpl(addr_list []string, conn *pgxpool.Conn, settings RequestS
 		}
 	}
 
-	if len(tasks) > 0 {
-		EnqueueMetadataFetchTasks(tasks)
+	if len(tasks) > 0 && BackgroundTaskManager != nil {
+		BackgroundTaskManager.EnqueueTasksIfPossible(tasks)
 	}
 	return metadata, nil
 }

@@ -19,15 +19,18 @@ import (
 )
 
 type Settings struct {
-	PgDsn        string
-	MaxConns     int
-	MinConns     int
-	Bind         string
-	InstanceName string
-	Prefork      bool
-	MaxThreads   int
-	Debug        bool
-	Request      index.RequestSettings
+	PgDsn           string
+	PgMasterDsn     string
+	TaskChannelSize int
+	MaxConns        int
+	MinConns        int
+	MasterMaxConns  int
+	Bind            string
+	InstanceName    string
+	Prefork         bool
+	MaxThreads      int
+	Debug           bool
+	Request         index.RequestSettings
 }
 
 func onlyOneOf(flags ...bool) bool {
@@ -41,6 +44,7 @@ func onlyOneOf(flags ...bool) bool {
 }
 
 var pool *index.DbClient
+var masterPool *index.DbClient
 var settings Settings
 
 //	@title			TON Index (Go)
@@ -1411,10 +1415,13 @@ func main() {
 	var timeout_ms int
 
 	flag.StringVar(&settings.PgDsn, "pg", "postgresql://postgres:RenTOPUDeThE@tc-db-01.toncenter.local:5432/testnet_c", "PostgreSQL connection string")
+	flag.StringVar(&settings.PgMasterDsn, "pg-master", "", "PostgreSQL connection string with write access")
 	flag.StringVar(&settings.Request.V2Endpoint, "v2", "", "TON HTTP API endpoint for proxied methods")
 	flag.StringVar(&settings.Request.V2ApiKey, "v2-apikey", "", "API key for TON HTTP API endpoint")
 	flag.IntVar(&settings.MaxConns, "maxconns", 100, "PostgreSQL max connections")
 	flag.IntVar(&settings.MinConns, "minconns", 0, "PostgreSQL min connections")
+	flag.IntVar(&settings.MasterMaxConns, "master-maxconns", 16, "PostgreSQL master max connections")
+	flag.IntVar(&settings.TaskChannelSize, "task-channel-size", 5000, "Task channel size")
 	flag.StringVar(&settings.Bind, "bind", ":8000", "Bind address")
 	flag.StringVar(&settings.InstanceName, "name", "Go", "Instance name to show in Swagger UI")
 	flag.BoolVar(&settings.Prefork, "prefork", false, "Prefork workers")
@@ -1540,7 +1547,22 @@ func main() {
 	}
 	app.Get("/api/v3/*", swagger.New(swagger_config))
 	app.Static("/", "./static")
-	index.StartMetadataFetchTaskWorker(context.Background(), pool.Pool)
+	index.BackgroundTaskManager, err = index.NewBackgroundTaskManager(settings.PgDsn, settings.TaskChannelSize,
+		0, settings.MasterMaxConns)
+	if err != nil {
+		if len(settings.PgMasterDsn) == 0 {
+			log.Printf("Error creating background task manager: %s", err.Error())
+		} else {
+			index.BackgroundTaskManager, err = index.NewBackgroundTaskManager(settings.PgMasterDsn,
+				settings.TaskChannelSize, 0, settings.MasterMaxConns)
+			if err != nil {
+				log.Printf("Error creating background task manager: %s", err.Error())
+			}
+		}
+	}
+	if index.BackgroundTaskManager != nil {
+		index.BackgroundTaskManager.Start(context.Background())
+	}
 	err = app.Listen(settings.Bind)
 	log.Fatal(err)
 }

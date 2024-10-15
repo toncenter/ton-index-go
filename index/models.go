@@ -41,10 +41,10 @@ type AddressBookRow struct {
 type AddressBook map[string]AddressBookRow // @name AddressBook
 type Metadata map[string]AddressMetadata   // @name Metadata
 
-type MetadataFetchTask struct {
-	Type    string
-	Address string
-	Retry   int
+type BackgroundTask struct {
+	Type  string
+	Retry int
+	Data  map[string]interface{}
 }
 
 type AddressMetadata struct {
