@@ -15,7 +15,6 @@ import (
 	"github.com/ipfs/kubo/repo"
 	"github.com/ipfs/kubo/repo/fsrepo"
 	"io"
-	"log"
 	"os"
 )
 
@@ -52,7 +51,7 @@ func NewIpfsDownloader() (downloader *IpfsDownloader, err error) {
 	}
 	repository, err := fsrepo.Open(repoPath)
 	if err != nil {
-		log.Fatalf("failed to open fsrepo: %s", err)
+		return nil, err
 	}
 
 	node, err := core.NewNode(ctx, &core.BuildCfg{
