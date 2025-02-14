@@ -687,7 +687,15 @@ func ScanAccountStateFull(row pgx.Row) (*AccountStateFull, error) {
 	if err != nil {
 		return nil, err
 	}
+	removeTrailingQuotes(acst.CodeBoc)
+	removeTrailingQuotes(acst.DataBoc)
 	return &acst, nil
+}
+
+func removeTrailingQuotes(s *string) {
+	if s != nil {
+		*s = strings.Trim(*s, "'")
+	}
 }
 
 func ScanAccountBalance(row pgx.Row) (*AccountBalance, error) {
