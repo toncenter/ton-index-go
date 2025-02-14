@@ -687,12 +687,12 @@ func ScanAccountStateFull(row pgx.Row) (*AccountStateFull, error) {
 	if err != nil {
 		return nil, err
 	}
-	removeTrailingQuotes(acst.CodeBoc)
-	removeTrailingQuotes(acst.DataBoc)
+	trimQuotes(acst.CodeBoc)
+	trimQuotes(acst.DataBoc)
 	return &acst, nil
 }
 
-func removeTrailingQuotes(s *string) {
+func trimQuotes(s *string) {
 	if s != nil {
 		*s = strings.Trim(*s, "'")
 	}
