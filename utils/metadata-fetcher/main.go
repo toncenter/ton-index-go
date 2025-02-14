@@ -558,7 +558,7 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to decode img proxy salt: ", err)
 	}
-	img_url_builder = NewImgProxyUrlBuilder(key, salt)
+	img_url_builder = NewImgProxyUrlBuilder(key, salt, "https://ipfs.io/ipfs")
 
 	if ipfs_api_url == "" {
 		log.Println("Starting embedded ipfs node..")
@@ -573,12 +573,6 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-
-	test, err := ipfs_downloader.GetFile(context.Background(), "ipfs://QmY5KwDPu6Et6N4yvKCzjXh1Z3D4GZzEyAkFwv83ynvRvs/2.json")
-	if err != nil {
-		log.Fatal(err)
-	}
-	println(test)
 
 	gate = semaphore.NewWeighted(int64(processes))
 	client = &http.Client{
