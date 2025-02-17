@@ -537,6 +537,7 @@ func main() {
 	var imgproxy_key string
 	var imgproxy_salt string
 	var ipfs_api_url string
+	var ipfs_server_url string
 	flag.StringVar(&pg_dsn, "pg", "postgresql://localhost:5432", "PostgreSQL connection string")
 	flag.IntVar(&processes, "processes", 32, "Set number of parallel queries")
 	flag.DurationVar(&initial_backoff, "initial-backoff", 5*time.Second, "Initial backoff duration")
@@ -548,6 +549,7 @@ func main() {
 	flag.StringVar(&imgproxy_salt, "imgproxy-salt", "", "ImgProxy salt")
 	flag.StringVar(&imgproxy_key, "imgproxy-key", "", "ImgProxy key")
 	flag.StringVar(&ipfs_api_url, "ipfs-api-url", "", "Ipfs api url")
+	flag.StringVar(&ipfs_server_url, "ipgs-server-url", "http://ipfs:8080/ipfs", "Ipfs gateway server url")
 	flag.Parse()
 
 	key, err := hex.DecodeString(imgproxy_key)
@@ -558,7 +560,7 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to decode img proxy salt: ", err)
 	}
-	img_url_builder = NewImgProxyUrlBuilder(key, salt, "https://ipfs.io/ipfs")
+	img_url_builder = NewImgProxyUrlBuilder(key, salt, ipfs_server_url)
 
 	if ipfs_api_url == "" {
 		log.Println("Starting embedded ipfs node..")
