@@ -548,8 +548,8 @@ func main() {
 		"Interval to update stalled tasks")
 	flag.StringVar(&imgproxy_salt, "imgproxy-salt", "", "ImgProxy salt")
 	flag.StringVar(&imgproxy_key, "imgproxy-key", "", "ImgProxy key")
-	flag.StringVar(&ipfs_api_url, "ipfs-api-url", "", "Ipfs api url")
-	flag.StringVar(&ipfs_server_url, "ipgs-server-url", "http://ipfs:8080/ipfs", "Ipfs gateway server url")
+	flag.StringVar(&ipfs_api_url, "ipfs-api-url", "", "Ipfs api url (http://127.0.0.1:5001)")
+	flag.StringVar(&ipfs_server_url, "ipfs-server-url", "https://ipfs.io/ipfs", "Ipfs gateway server url")
 	flag.Parse()
 
 	key, err := hex.DecodeString(imgproxy_key)
